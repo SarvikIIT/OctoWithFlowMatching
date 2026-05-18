@@ -116,7 +116,7 @@ class OctoModel:
                 len(texts), dtype=bool
             )
         else:
-            batch_size = jax.tree_leaves(goals)[0].shape[0]
+            batch_size = jax.tree.leaves(goals)[0].shape[0]
             tasks["language_instruction"] = [""] * batch_size
             tasks["pad_mask_dict"]["language_instruction"] = np.zeros(
                 batch_size, dtype=bool
@@ -296,12 +296,12 @@ class OctoModel:
         logging.debug(
             "Model was trained with observations: %s",
             flax.core.pretty_repr(
-                jax.tree_map(jnp.shape, example_batch["observation"])
+                jax.tree.map(jnp.shape, example_batch["observation"])
             ),
         )
         logging.debug(
             "Model was trained with tasks: %s",
-            flax.core.pretty_repr(jax.tree_map(jnp.shape, example_batch["task"])),
+            flax.core.pretty_repr(jax.tree.map(jnp.shape, example_batch["task"])),
         )
 
         # load dataset statistics
@@ -309,7 +309,7 @@ class OctoModel:
             tf.io.gfile.join(checkpoint_path, "dataset_statistics.json"), "r"
         ) as f:
             dataset_statistics = json.load(f)
-            dataset_statistics = jax.tree_map(
+            dataset_statistics = jax.tree.map(
                 np.array, dataset_statistics, is_leaf=lambda x: not isinstance(x, dict)
             )
 
@@ -408,7 +408,7 @@ class OctoModel:
             if not tf.io.gfile.exists(dataset_statistics_path):
                 with tf.io.gfile.GFile(dataset_statistics_path, "w") as f:
                     json.dump(
-                        jax.tree_map(lambda x: x.tolist(), self.dataset_statistics),
+                        jax.tree.map(lambda x: x.tolist(), self.dataset_statistics),
                         f,
                     )
 
@@ -436,7 +436,11 @@ class OctoModel:
         module = OctoModule.create(**config["model"])
         rng = rng if rng is not None else jax.random.PRNGKey(0)
         example_batch = multihost_utils.process_allgather(example_batch)
-        example_batch = jax.tree_map(lambda x: x[:1], example_batch)
+        # Squeeze the leading host dimension added by process_allgather, then take first sample
+        example_batch = jax.tree.map(
+            lambda x: x.reshape(-1, *x.shape[2:])[:1] if x.ndim >= 2 else x[:1],
+            example_batch,
+        )
 
         init_args = (
             example_batch["observation"],
@@ -480,7 +484,7 @@ class OctoModel:
             if k.startswith("image")
         }
         if self.text_processor is not None:
-            task_space["language_instruction"] = jax.tree_map(
+            task_space["language_instruction"] = jax.tree.map(
                 lambda arr: ("batch", *arr.shape[1:]),
                 self.example_batch["task"]["language_instruction"],
             )

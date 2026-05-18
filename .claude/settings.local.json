@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tests/overfit_flow.py --unit)",
+      "Bash(python3 -c \"import jax; print\\('JAX:', jax.__version__\\); import flax; print\\('Flax:', flax.__version__\\); import optax; print\\('Optax:', optax.__version__\\)\")",
+      "Bash(pip3 list:*)",
+      "Read(//usr/bin/**)",
+      "Bash(pyenv versions:*)",
+      "Bash(uv python:*)",
+      "Bash(uv --version)",
+      "Bash(nvidia-smi)",
+      "Bash(pip3 --version)",
+      "Bash(python3 -m pip --version)",
+      "Bash(python3 -m ensurepip --default-pip)",
+      "Bash(apt list:*)",
+      "Bash(dpkg -l python3-pip)",
+      "Bash(dpkg -l python3-venv)",
+      "Bash(sudo apt-get:*)",
+      "Bash(curl -sSf https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py)",
+      "Bash(python3 /tmp/get-pip.py --user)",
+      "Bash(python3 /tmp/get-pip.py --user --break-system-packages)",
+      "Bash(export PATH=\"$HOME/.local/bin:$PATH\")",
+      "Bash(pip --version)",
+      "Bash(python3 -m venv /home/sarvik/Desktop/Octo/.venv)",
+      "Bash(python3 -m venv --without-pip /home/sarvik/Desktop/Octo/.venv)",
+      "Bash(/home/sarvik/Desktop/Octo/.venv/bin/python3 /tmp/get-pip.py)",
+      "Bash(/home/sarvik/Desktop/Octo/.venv/bin/python3 --version)",
+      "Bash(/home/sarvik/Desktop/Octo/.venv/bin/pip --version)",
+      "Bash(/home/sarvik/Desktop/Octo/.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python3 -c ':*)",
+      "Bash(.venv/bin/python3 tests/overfit_flow.py --unit)",
+      "Bash(.venv/bin/python3 tests/overfit_flow.py --full)",
+      "Bash(.venv/bin/python3 -c \"from tests.debug_config import get_config; c = get_config\\(\\); print\\('Config loaded OK'\\); print\\('batch_size:', c.dataset_kwargs.batch_size\\)\")",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(.venv/bin/python3 -c \"from pkg_resources import parse_version; print\\('OK'\\)\")"
+    ]
+  }
+}

@@ -9,10 +9,14 @@ import jax
 from jax import Array
 import jax.numpy as jnp
 from jax.typing import ArrayLike
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from octo.model.components.base import TokenGroup
 from octo.model.components.diffusion import cosine_beta_schedule, create_diffusion_model
 from octo.model.components.flow import create_flow_model
+from octo.model.components.pca import fit_pca, transform_pca
+from octo.model.components.kmeans import fit_kmeans, assign_clusters
 from octo.model.components.tokenizers import BinTokenizer
 from octo.model.components.transformer import MAPHead
 from octo.model.components.unet import ConditionalUnet1D, unet_squaredcos_cap_v2
@@ -57,7 +61,7 @@ class ActionHead(ABC):
 
 def masked_mean(x, mask):
     mask = jnp.broadcast_to(mask, x.shape)
-    return jnp.mean(x * mask) / jnp.clip(jnp.mean(mask), a_min=1e-5, a_max=None)
+    return jnp.mean(x * mask) / jnp.clip(jnp.mean(mask), min=1e-5)
 
 
 def continuous_loss(
@@ -682,14 +686,35 @@ class FlowMatchActionHead(nn.Module):
 
         actions_flat = rearrange(actions, "b w h a -> b w (h a)")
         actions_flat = jnp.clip(actions_flat, -self.max_action, self.max_action)
-
+        token_group = transformer_outputs[self.readout_key]
+        embeddings = token_group.tokens.mean(axis=-2)
+        obs_flat = embeddings.mean(axis=1)  # (batch, window)
+        mean, components = fit_pca(obs_flat, n_components=32)
+        obs_reduced = transform_pca(obs_flat, mean, components)
+        centroids = fit_kmeans(obs_reduced, n_clusters=64)
+        c_a = assign_clusters(obs_reduced, centroids)
         rng = self.make_rng("dropout")
+        rng, rng_perm = jax.random.split(rng)
+        c_x0 = c_a[jax.random.permutation(rng_perm, batch_size)]
         time_key, noise_key = jax.random.split(rng)
         time = jax.random.uniform(
             time_key,
             (self.n_flow_samples, batch_size, window_size, 1),
         )
         noise = jax.random.normal(noise_key, (self.n_flow_samples,) + actions_flat.shape)
+
+        noise_2d = noise[0].reshape(batch_size, -1)
+        actions_2d = actions_flat.reshape(batch_size, -1)
+        spatial_dist = jnp.mean(jnp.sum((noise_2d - actions_2d) ** 2, axis=-1))
+        cond_dist = jnp.mean((c_x0 != c_a).astype(jnp.float32))
+        gamma = 10.0 * spatial_dist / (cond_dist + 1e-8)
+
+        cost = (
+            jnp.sum((noise_2d[:, None, :] - actions_2d[None, :, :])**2,axis = -1)
+            + gamma * (c_x0[:, None] != c_a[None, :]).astype(jnp.float32)
+        )
+        _, pi = linear_sum_assignment(np.array(cost))
+        noise = noise[:, pi,: ]
 
         noisy_actions = (1 - time) * noise + time * actions_flat[None]
         v_target = actions_flat[None] - noise
@@ -970,7 +995,7 @@ class UNetDDPMActionHead(nn.Module):
             if self.variance_type == "fixed_large":
                 variance = 1 - alpha
             elif self.variance_type == "fixed_small":
-                variance = jnp.clip(variance, a_min=1e-20)
+                variance = jnp.clip(variance, min=1e-20)
             else:
                 raise ValueError("Invalid schedule provided")
 

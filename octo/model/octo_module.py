@@ -125,11 +125,11 @@ class OctoTransformer(nn.Module):
             set(self.readouts.keys())
         ), "readouts must be specified in the model config"
 
-        batch_size, horizon = jax.tree_util.tree_leaves(observations)[0].shape[:2]
+        batch_size, horizon = jax.tree.leaves(observations)[0].shape[:2]
         assert horizon <= self.max_horizon, "horizon must be <= max_horizon"
-        assert jax.tree_util.tree_all(
-            jax.tree_map(lambda x: x.shape[1] == horizon, observations)
-        ), "observations must have the same horizon"
+        assert all(jax.tree.leaves(
+            jax.tree.map(lambda x: x.shape[1] == horizon, observations)
+        )), "observations must have the same horizon"
 
         #
         # Attention rules for the transformer
