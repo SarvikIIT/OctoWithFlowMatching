@@ -12,6 +12,7 @@ from jax.typing import ArrayLike
 
 from octo.model.components.base import TokenGroup
 from octo.model.components.diffusion import cosine_beta_schedule, create_diffusion_model
+from octo.model.components.flow import create_flow_model
 from octo.model.components.tokenizers import BinTokenizer
 from octo.model.components.transformer import MAPHead
 from octo.model.components.unet import ConditionalUnet1D, unet_squaredcos_cap_v2
@@ -607,6 +608,157 @@ class DiffusionActionHead(nn.Module):
             a=self.action_dim,
         )
         # only get the last timestep in the window
+        return actions[..., -1, :, :]
+
+
+class FlowMatchActionHead(nn.Module):
+    """Predicts actions using conditional flow matching.
+
+    Same interface as DiffusionActionHead — drop-in replacement.
+    Forward process: a_τ = (1-τ)·ε + τ·a, target velocity: v = a - ε.
+    Inference: 10 Euler steps from pure noise.
+    """
+
+    readout_key: str
+    use_map: bool = False
+    action_horizon: int = 1
+    action_dim: int = 7
+    max_action: float = 5.0
+    loss_type: str = "mse"
+
+    time_dim: int = 32
+    num_blocks: int = 3
+    dropout_rate: float = 0.0
+    hidden_dim: int = 256
+    use_layer_norm: bool = True
+    flow_steps: int = 10
+    n_flow_samples: int = 1
+
+    def setup(self):
+        if self.use_map:
+            self.map_head = MAPHead()
+        self.flow_model = create_flow_model(
+            self.action_dim * self.action_horizon,
+            time_dim=self.time_dim,
+            num_blocks=self.num_blocks,
+            dropout_rate=self.dropout_rate,
+            hidden_dim=self.hidden_dim,
+            use_layer_norm=self.use_layer_norm,
+        )
+
+    def __call__(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        time: Optional[ArrayLike] = None,
+        noisy_actions: Optional[ArrayLike] = None,
+        train: bool = True,
+    ) -> jax.Array:
+        token_group = transformer_outputs[self.readout_key]
+        assert token_group.tokens.ndim == 4
+        if self.use_map:
+            embeddings = self.map_head(token_group, train=train)[:, :, 0]
+        else:
+            embeddings = token_group.tokens.mean(axis=-2)
+
+        if (time is None or noisy_actions is None) and not self.is_initializing():
+            raise ValueError("Must provide time and noisy_actions when calling flow action head")
+        elif self.is_initializing():
+            time = jnp.zeros((*embeddings.shape[:2], 1), dtype=jnp.float32)
+            noisy_actions = jnp.zeros(
+                (*embeddings.shape[:2], self.action_dim * self.action_horizon),
+                dtype=jnp.float32,
+            )
+        return self.flow_model(embeddings, noisy_actions, time, train=train)
+
+    def loss(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        actions: ArrayLike,
+        timestep_pad_mask: ArrayLike,
+        action_pad_mask: ArrayLike,
+        train: bool = True,
+    ) -> Tuple[Array, Dict[str, Array]]:
+        batch_size, window_size = timestep_pad_mask.shape
+
+        actions_flat = rearrange(actions, "b w h a -> b w (h a)")
+        actions_flat = jnp.clip(actions_flat, -self.max_action, self.max_action)
+
+        rng = self.make_rng("dropout")
+        time_key, noise_key = jax.random.split(rng)
+        time = jax.random.uniform(
+            time_key,
+            (self.n_flow_samples, batch_size, window_size, 1),
+        )
+        noise = jax.random.normal(noise_key, (self.n_flow_samples,) + actions_flat.shape)
+
+        noisy_actions = (1 - time) * noise + time * actions_flat[None]
+        v_target = actions_flat[None] - noise
+
+        vel_pred = self(transformer_outputs, train=train, time=time, noisy_actions=noisy_actions)
+
+        mask = timestep_pad_mask[:, :, None, None] & action_pad_mask
+        mask = rearrange(mask, "b w h a -> b w (h a)")
+        mask = mask[None]
+
+        loss, metrics = continuous_loss(vel_pred, v_target, mask, loss_type=self.loss_type)
+        loss = loss * self.action_dim
+        metrics["loss"] = metrics["loss"] * self.action_dim
+        metrics["mse"] = metrics["mse"] * self.action_dim
+        return loss, metrics
+
+    def predict_action(
+        self,
+        transformer_outputs: Dict[str, TokenGroup],
+        rng: PRNGKey,
+        train: bool = True,
+        embodiment_action_dim: Optional[int] = None,
+        *args,
+        sample_shape: tuple = (),
+        **kwargs,
+    ) -> jax.Array:
+        dt = 1.0 / self.flow_steps
+        if embodiment_action_dim is None:
+            logging.warning(
+                "embodiment_action_dim is highly recommended for flow action head"
+                " if any action dimensions were masked during training"
+            )
+        batch_size, window_size = transformer_outputs[self.readout_key].tokens.shape[:2]
+        module, variables = self.unbind()
+
+        action_mask = jnp.ones(
+            (*sample_shape, batch_size, window_size, self.action_horizon, self.action_dim),
+            dtype=bool,
+        )
+        if embodiment_action_dim is not None:
+            action_mask = action_mask.at[..., embodiment_action_dim:].set(False)
+        flat_action_mask = rearrange(action_mask, "... p a -> ... (p a)")
+
+        rng, key = jax.random.split(rng)
+        noise = jax.random.normal(
+            key,
+            (*sample_shape, batch_size, window_size, self.action_horizon * self.action_dim),
+        )
+
+        def scan_fn(carry, tau):
+            current_x, rng = carry
+            input_time = jnp.broadcast_to(
+                jnp.array(tau, dtype=jnp.float32), (*current_x.shape[:-1], 1)
+            )
+            vel_pred = module.apply(
+                variables, transformer_outputs, input_time, current_x, train=train
+            )
+            current_x = current_x + dt * vel_pred
+            current_x = jnp.clip(current_x, -self.max_action, self.max_action)
+            current_x = jnp.where(flat_action_mask, current_x, noise)
+            return (current_x, rng), ()
+
+        (actions_flat, _), () = jax.lax.scan(
+            scan_fn,
+            (noise, rng),
+            jnp.arange(self.flow_steps) * dt,
+        )
+
+        actions = rearrange(actions_flat, "... (h a) -> ... h a", h=self.action_horizon, a=self.action_dim)
         return actions[..., -1, :, :]
 
 
